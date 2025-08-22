@@ -150,16 +150,22 @@ if __name__ == "__main__":
 
             if n_keyframes == args.num_keyframes_miniba_bootstrap - 1:
                 start_time = time.time()
-                Rts, f, _ = pose_initializer.initialize_bootstrap(bootstrap_desc_kpts)
+
+                bootstrap_infos = None
+                if args.refine_poses:
+                    bootstrap_infos = [d["info"] for d in bootstrap_keyframe_dicts]
+                    Rts, f, _ = pose_initializer.initialize_bootstrap_refine(bootstrap_desc_kpts, bootstrap_infos)
+                else:
+                    Rts, f, _ = pose_initializer.initialize_bootstrap(bootstrap_desc_kpts)
+
                 focal = f.cpu().item()
                 increment_runtime(runtimes["BAB"], start_time)
                 for index, (keyframe_dict, desc_kpts, Rt) in enumerate(
                     zip(bootstrap_keyframe_dicts, bootstrap_desc_kpts, Rts)
                 ):
                     start_time = time.time()
-                    if args.use_colmap_poses:
-                        Rt = keyframe_dict["info"]["Rt"]
-                        f = keyframe_dict["info"]["focal"]
+                    if args.use_precomputed_poses and not args.refine_poses:
+                        Rt = keyframe_dict["info"]["precomputed_pose"]
                     keyframe = Keyframe(
                         keyframe_dict["image"],
                         keyframe_dict["info"],
@@ -206,6 +212,7 @@ if __name__ == "__main__":
                     rel_dist > 0.1 * 5 or rel_dist < 0.1 / 3
                 ) and n_keyframes - last_reboot > 50
             if needs_reboot:
+                print("WARNING: Rebooting the scene model due to unexpected camera baseline size.")
                 # Reboot: run mini BA on the last 8 keyframes
                 bs_kfs = scene_model.keyframes[-8:]
                 bootstrap_desc_kpts = [bs_kf.desc_kpts for bs_kf in bs_kfs]
@@ -236,14 +243,24 @@ if __name__ == "__main__":
                 )
                 increment_runtime(runtimes["tri"], start_time)
                 start_time = time.time()
-                Rt = pose_initializer.initialize_incremental(
-                    prev_keyframes, desc_kpts, n_keyframes, info["is_test"], image
-                )
+
+                if args.refine_poses:
+                    incr_info = info
+                    Rt = pose_initializer.initialize_incremental_refine(prev_keyframes, desc_kpts, n_keyframes, info["is_test"], image, incr_info=incr_info)
+                # if args.use_precomputed_poses:
+                #     camera_center = -info["precomputed_pose"][:3, :3].T @ info["precomputed_pose"][:3, 3]
+                #     prev_keyframes = scene_model.get_closest_keyframes(
+                #         args.num_prev_keyframes_miniba_incr, camera_center
+                #     )
+                else:
+                    Rt = pose_initializer.initialize_incremental(
+                        prev_keyframes, desc_kpts, n_keyframes, info["is_test"], image
+                    )
                 increment_runtime(runtimes["BAI"], start_time)
                 start_time = time.time()
                 if Rt is not None:
-                    if args.use_colmap_poses:
-                        Rt = info["Rt"]
+                    if args.use_precomputed_poses and not args.refine_poses:
+                        Rt = info["precomputed_pose"]
                     keyframe = Keyframe(
                         image,
                         info,
@@ -335,7 +352,70 @@ if __name__ == "__main__":
         )
     )
 
-    # Fine tuning after initial reconstruction
+    if args.holdout_frames:
+        print("\n--- Starting Iterative Refinement Phase ---")
+
+        scene_model.inference_mode = False
+        scene_model.refinement_mode = True
+        scene_model.reset_optimizer()
+        
+        active_anchor = scene_model.anchors[0] # Assuming we have a scene with only one anchor for now, better performance
+        active_anchor.to("cuda", with_keyframes=True)
+        scene_model.active_anchor = active_anchor
+        scene_model.gaussian_params = active_anchor.gaussian_params
+
+        num_holdout_frames = len(dataset.holdout_indices)
+        #indices = torch.randperm(num_holdout_frames).tolist()
+        indices = list(range(num_holdout_frames))
+        pbar_refinement = tqdm(indices, desc="Refining holdout frames")
+
+        for i in pbar_refinement:
+            #print(f"\n--- Refining with holdout frame {i+1}/{len(dataset.holdout_indices)} ({dataset.holdout_name_list[i]}) ---")
+            
+            image_tensor, info = dataset.get_holdout_item(i)
+            
+            desc_kpts = detector(image_tensor)
+
+            #cam_centre = -refined_Rt[:3, :3].T @ refined_Rt[:3, 3]
+            # dists = torch.linalg.vector_norm(torch.stack([a.position for a in scene_model.anchors]) - cam_centre[None], dim=-1)
+            # anchor_id_to_activate = torch.argmin(dists).item()
+            
+            #print(f"Activating anchor {anchor_id_to_activate}")
+            # active_anchor = scene_model.anchors[anchor_id_to_activate]
+            # active_anchor.to("cuda", with_keyframes=True)
+            # scene_model.active_anchor = active_anchor
+            # scene_model.gaussian_params = active_anchor.gaussian_params
+
+            closest_keyframes = scene_model.get_prev_keyframes(
+                    args.num_prev_keyframes_miniba_incr, True, desc_kpts
+                )
+            
+            new_kf_index = len(scene_model.keyframes)
+
+            Rt = pose_initializer.initialize_incremental_refine(closest_keyframes, desc_kpts, new_kf_index, info["is_test"], image_tensor, info)
+
+            keyframe = Keyframe(image_tensor, info,
+                                desc_kpts, Rt, new_kf_index, f,
+                                dense_extractor, depth_estimator, triangulator, args)
+            
+            scene_model.add_keyframe(keyframe)
+
+            scene_model.add_new_gaussians()
+            
+            for _ in range(args.num_iterations):
+                scene_model.optimization_step()
+
+            # active_anchor.gaussian_params = scene_model.gaussian_params
+            # active_anchor.to("cpu", with_keyframes=True)
+            pbar_refinement.set_postfix_str(f"Gaussians:{scene_model.n_active_gaussians}, Keyframes:{len(scene_model.keyframes)}")
+
+    scene_model.refinement_mode = False
+    # Make sure to set inference mode before the final save
+    scene_model.enable_inference_mode()
+    final_metrics = scene_model.save(os.path.join(args.model_path, "final"), 0, 0) # Time is not tracked yet for refinement
+    print("Final metrics after refinement:", final_metrics)
+
+    # Fine tuning
     if len(args.save_at_finetune_epoch) > 0:
         finetune_epochs = max(args.save_at_finetune_epoch)
         torch.cuda.empty_cache()
@@ -362,7 +442,7 @@ if __name__ == "__main__":
                 torch.cuda.empty_cache()
                 
         # Set to inference mode so that the model can be rendered properly
-        scene_model.inference_mode = True
+        #scene_model.inference_mode = True
 
     if args.viewer_mode != "none":
         if args.viewer_mode == "web":

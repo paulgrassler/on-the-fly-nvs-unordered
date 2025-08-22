@@ -159,6 +159,7 @@ class SceneModel:
         self.valid_keyframes = torch.empty(0, dtype=torch.bool)
         self.lock = threading.Lock()
         self.inference_mode = inference_mode
+        self.refinement_mode = False
 
         ## Initialize helpers for Gaussian initialization
         radius = 3
@@ -678,6 +679,7 @@ class SceneModel:
         init_proba *= self.init_proba_scaler
         penalty *= self.init_proba_scaler
         sample_mask = torch.rand_like(init_proba) < init_proba - penalty # eq. 3
+        inital_number_of_samples = sample_mask.sum().item()
 
         sampled_uv = self.uv[sample_mask]
         ## Initialize positions
@@ -696,7 +698,16 @@ class SceneModel:
         sampled_uv = sampled_uv[valid_mask]
         accurate_mask = accurate_mask[valid_mask]
 
+        # if self.refinement_mode: #HIGHLY EXPERIMENTAL
+        #     # If in refinement mode, we only keep the points that are accurate
+        #     sample_mask[sample_mask.clone()] = accurate_mask
+        #     depth = depth[accurate_mask]
+        #     sampled_uv = sampled_uv[accurate_mask]
+        #     accurate_mask = accurate_mask[accurate_mask]
+        #     print(f"{sampled_uv.shape[0]}/{inital_number_of_samples} accurate points will be added.")
+
         # Remove Gaussians that are coarser than the newpoints
+        print(f"Found {sampled_uv.shape[0]}/{inital_number_of_samples} valid points to add. Accurate: {accurate_mask.sum().item()}/{sampled_uv.shape[0]}")
         if len(self.xyz) > 0:
             main_gaussians_map = render_pkg["mainGaussID"]
             accurate_sample_mask = sample_mask.clone()
@@ -782,6 +793,8 @@ class SceneModel:
         rots = torch.zeros(f_dc.shape[0], 4, device="cuda")
         rots[:, 0] = 1
 
+        print(f"DEBUG: For keyframe {keyframe.index}, found {new_pts.shape[0]} valid new points to add.")
+
         ## Get which Gaussians should be pruned
         if self.xyz.shape[0] > 0:
             # Only keep Gaussians with non neglectible opacity
@@ -807,6 +820,8 @@ class SceneModel:
         }
         with self.lock:
             self.optimizer.add_and_prune(extension_tensors, valid_gs_mask)
+
+        print(f"Currently {self.n_active_gaussians} active Gaussians.")
 
     def init_intrinsics(self):
         self.FoVx = focal2fov(self.f, self.width)

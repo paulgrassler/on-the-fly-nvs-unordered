@@ -136,6 +136,29 @@ class MiniBAInternal(nn.Module):
                 *self.prepare_for_proj(xyz, Rs6D, ts, f, centre), uv
             )
             r_in = r_in.view(-1)
+
+            valid_mask_float = original_mask2.view(-1).float()
+            num_valid_residuals = valid_mask_float.sum()
+
+            if self.batch == 1 and False:
+                with torch.no_grad():
+                    # 1. Get the robust mask, the same one the optimizer will use.
+                    #    This correctly ignores invalid observations.
+                    active_mask = self.get_mask(r_in, original_mask2)
+                    
+                    # 2. Reshape residuals and mask to be per-point, per-camera.
+                    residuals_2d = r_in.view(-1, 2)
+                    active_mask_2d = active_mask.view(-1, 2)
+
+                    # 3. Select only the residuals for the active, valid observations.
+                    #    We use boolean indexing, which is safe here because batch==1.
+                    valid_residuals = residuals_2d[active_mask_2d.all(dim=1)]
+                    
+                    if valid_residuals.numel() > 0:
+                        rmse = torch.sqrt((valid_residuals**2).mean()).item()
+                        if iteration % 5 == 0:
+                            lm_val = lm.item() if isinstance(lm, torch.Tensor) else lm
+                            print(f"  [MiniBA Iter {iteration+1:03d}/{self.iters}] RMSE: {rmse:.4f} px, lm: {lm_val:.2e}")
             # Jacobian w.r.t the camera poses
             duv_dcam = jacobian_elements[self.param2id_dict["poses"]]
             duv_dcam = duv_dcam.unsqueeze(-2).repeat(1, 1, 1, self.n_opt_cams, 1)

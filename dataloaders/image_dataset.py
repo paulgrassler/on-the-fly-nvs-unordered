@@ -17,7 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 import logging
 from argparse import Namespace
-
+import json
+import exifread
 from dataloaders.read_write_model import read_model, qvec2rotmat
 from utils import get_image_names
 
@@ -80,39 +81,83 @@ class ImageDataset:
             self.width, self.height = first_image.shape[2], first_image.shape[1]
 
 
-        # Load COLMAP data
-        self.load_colmap_data(os.path.join(args.source_path, "sparse/0"))
+        if args.info_type == "json": 
+            info_path = os.path.join(args.source_path, "info")
+            self.load_json_data(info_path)
+        elif args.info_type == "exif":
+            self.load_exif_data(os.path.join(args.source_path, "images"))
+        elif args.info_type == "colmap":
+            self.load_colmap_data(os.path.join(args.source_path, "sparse/0"))
+        
+        if args.gt_type == "colmap":
+            self.load_colmap_data(os.path.join(args.source_path, "sparse/0"),  pose_key="Rt")
+        elif args.gt_type == "exif":
+            self.load_exif_data(os.path.join(args.source_path, "images"), pose_key="Rt")
+            
 
         # Check that all images have poses
         has_all_poses = all(
+            "precomputed_pose" in self.infos[image_name] for image_name in self.image_name_list
+        )
+        has_all_gt_poses = all(
             "Rt" in self.infos[image_name] for image_name in self.image_name_list
         )
-        if args.use_colmap_poses:
+        if args.use_precomputed_poses:
             assert has_all_poses, (
-                "COLMAP poses are required but not all images have poses."
+                "Precomputed poses are required but not all images have poses."
             )
-            self.align_colmap_poses()
+            self.align_precomputed_poses()
 
-        if args.eval_poses and not has_all_poses:
+        if args.eval_poses and not has_all_gt_poses:
             logging.warning(
                 " Not all images have COLMAP poses, pose evaluation will be skipped."
             )
 
+
+        self.train_indices = []
+        self.holdout_indices = []
+        self.holdout_name_list = []
+        
+        full_image_name_list = sorted(get_image_names(self.images_dir))
+
+        holdout_names = {full_image_name_list[i] for i in args.holdout_frames if i < len(full_image_name_list)}
+        
+        for i, name in enumerate(self.image_name_list):
+            if name in holdout_names:
+                self.holdout_indices.append(i)
+                self.holdout_name_list.append(name)
+            else:
+                self.train_indices.append(i)
+
+        self.train_image_paths = [self.image_paths[i] for i in self.train_indices]
+        self.holdout_image_paths = [self.image_paths[i] for i in self.holdout_indices]
+
         self.start_preloading()
 
+    def get_holdout_item(self, holdout_idx):
+        """Gets a specific item from the holdout set."""
+        image_path = self.holdout_image_paths[holdout_idx]
+        image = self._load_image(image_path, cv2.IMREAD_UNCHANGED)
+        info = self.infos[os.path.basename(image_path)]
+        if image.shape[0] == 4:
+            info["mask"] = image[-1][None].cpu()
+            image = image[:3]
+        return image.cuda(), info
+
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.train_image_paths)
 
     @torch.no_grad()
     def __getitem__(self, index):
-        image_path = self.image_paths[index]
+        original_idx = self.train_indices[index]
+        image_path = self.image_paths[original_idx] # Use original full path list
         image = self._load_image(image_path, cv2.IMREAD_UNCHANGED)
         info = self.infos[os.path.basename(image_path)]
         if image.shape[0] == 4:
             info["mask"] = image[-1][None].cpu()
             image = image[:3]
         if self.mask_dir:
-            mask = self._load_image(self.mask_paths[index])
+            mask = self._load_image(self.mask_paths[original_idx])
             info["mask"] = mask[0][None]
         return image.cuda(), info
 
@@ -153,7 +198,75 @@ class ImageDataset:
     def get_image_size(self):
         return self.height, self.width
 
-    def load_colmap_data(self, colmap_folder_path):
+    def load_exif_data(self, image_dir_path, pose_key="precomputed_pose"):
+        for image_name in self.image_name_list:
+            image_path = os.path.join(image_dir_path, image_name)
+        
+            with open(image_path, 'rb') as f:
+                tags = exifread.process_file(f)
+
+            comment_tag = tags.get('EXIF UserComment')
+
+            if not comment_tag:
+                print(f"Warning: No 'EXIF UserComment' tag found in {image_name}")
+                continue
+
+            comment_str = comment_tag.values
+            
+            json_start_index = comment_str.find('{')
+            if json_start_index == -1:
+                print(f"Warning: Could not find JSON start in UserComment for {image_name}")
+                continue
+            
+            json_str = comment_str[json_start_index:]
+            
+            pose_data = json.loads(json_str)
+            pos = pose_data['position']
+            rot = pose_data['rotation']
+
+            c2w = torch.eye(4, dtype=torch.float32)
+            c2w[:3, :3] = torch.from_numpy(qvec2rotmat([rot['w'], -rot['x'], rot['y'], -rot['z']]))
+            c2w[:3, 3] = torch.from_numpy(np.array([pos['x'], -pos['y'], pos['z']]))
+    
+            w2c = torch.inverse(c2w)
+            
+            self.infos[image_name][pose_key] = w2c.cuda()
+
+    def load_json_data(self, info_dir_path):
+        """Load camera intrinsics and extrinsics from custom JSON files."""
+        T_world = torch.diag(torch.tensor([1., 1., -1., 1.])).float()
+
+        T_cam = torch.diag(torch.tensor([1., -1., 1., 1.])).float()
+
+        for image_name in self.image_name_list:
+            base_name = os.path.splitext(image_name)[0]
+            json_name = base_name.replace("Image_", "Metadata_") + ".json"
+            json_path = os.path.join(info_dir_path, json_name)
+
+            if not os.path.exists(json_path):
+                print(f"Warning: Could not find JSON info file for {image_name}")
+                continue
+
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+
+            intrinsics = data["intrinsics"]
+            fx = intrinsics["fx"]
+            fy = intrinsics["fy"]
+            # The framework uses a single focal length, so we average them
+            focal = (fx + fy) / 2.0
+            
+            matrix_c2w_opengl = torch.tensor(data["cameraToWorldMatrix"]).reshape(4, 4).T #transpose to convert to row-major
+
+            temp_matrix_c2w_opencv =  matrix_c2w_opengl @ T_cam 
+
+            matrix_c2w_opencv = T_world @ temp_matrix_c2w_opencv        
+            
+            matrix_w2c = torch.inverse(matrix_c2w_opencv)
+
+            self.infos[image_name]["precomputed_pose"] = matrix_w2c.cuda()
+    
+    def load_colmap_data(self, colmap_folder_path, pose_key="precomputed_pose"):
         """Load COLMAP camera intrinsics and extrinsics. Stores them in self.infos."""
         try:
             cameras, images, _ = read_model(colmap_folder_path)
@@ -175,29 +288,27 @@ class ImageDataset:
             focal_x = camera.params[0]
             focal_y = camera.params[1] if camera.model == "PINHOLE" else focal_x
             focal = (focal_x + focal_y) / 2
-            focal = focal_x * self.width / camera.width
+            focal = focal * self.width / camera.width
 
             # Pose
             Rt = np.eye(4, dtype=np.float32)
             Rt[:3, :3] = qvec2rotmat(image.qvec)
             Rt[:3, 3] = image.tvec
 
-            # Store CameraInfo for each image
             name = os.path.basename(image.name)
             if image.name in self.infos:
-                self.infos[name]["Rt"] = torch.tensor(Rt, device="cuda")
-                self.infos[name]["focal"] = torch.tensor([focal], device="cuda").float()
+                self.infos[name][pose_key] = torch.tensor(Rt, device="cuda")
 
-    def align_colmap_poses(self):
+    def align_precomputed_poses(self, pose_key="precomputed_pose"):
         """Scale and set first Rt as identity"""
         centres = []
         for idx in range(6):
-            centres.append(self.infos[self.image_name_list[idx]]["Rt"].inverse()[:3, 3])
+            centres.append(self.infos[self.image_name_list[idx]][pose_key].inverse()[:3, 3])
         centres = torch.stack(centres)
         rel_ts = centres[:-1] - centres[1:]
 
         scale = 0.1 / rel_ts.norm(dim=-1).mean()
-        inv_first_Rt = self.infos[self.image_name_list[0]]["Rt"].inverse()
+        inv_first_Rt = self.infos[self.image_name_list[0]][pose_key].inverse()
         for info in self.infos.values():
-            info["Rt"] = info["Rt"] @ inv_first_Rt
-            info["Rt"][:3, 3] *= scale
+            info[pose_key] = info[pose_key] @ inv_first_Rt
+            info[pose_key][:3, 3] *= scale

@@ -34,10 +34,22 @@ def get_args():
     
     parser.add_argument('--sh_degree', default=3)
 
+    parser.add_argument("--holdout_frames", nargs="+", type=int, default=[],
+                    help="List of frame indices to hold out from the initial training.") 
+
+    parser.add_argument("--refine_poses", action="store_true", 
+                    help="If set, uses provided poses as initial guess for refinement.")
+    
+    parser.add_argument('--info_type', type=str, default="",
+                        help="Type of info file to load, either 'json' or 'colmap'.")
+    
+    parser.add_argument('--gt_type', type=str, default="",
+                        help="If set to a value other then 'none', will load the appropriate gt data for calculating pose error, etc.")
+
     ## COLMAP options
     parser.add_argument('--eval_poses', action='store_true',
                         help="Compare poses to COLMAP")
-    parser.add_argument('--use_colmap_poses', action='store_true',
+    parser.add_argument('--use_precomputed_poses', action='store_true',
                         help="Load COLMAP data for pose and intrinsics initialization")
         
     ## Learning Rates
@@ -56,7 +68,7 @@ def get_args():
         
     ## Training schedule and losses
     parser.add_argument('--lambda_dssim', type=float, default=0.2, help="Weight for DSSIM loss")
-    parser.add_argument('--num_iterations', type=int, default=30, 
+    parser.add_argument('--num_iterations', type=int, default=200, 
                         help="Number of training iterations per keyframe")
     parser.add_argument('--depth_loss_weight_init', type=float, default=1e-2)
     parser.add_argument('--depth_loss_weight_decay', type=float, default=0.9, 

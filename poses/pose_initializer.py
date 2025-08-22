@@ -14,9 +14,10 @@ import math
 
 from poses.feature_detector import DescribedKeypoints
 from poses.mini_ba import MiniBA
-from utils import fov2focal, depth2points, sixD2mtx
+from utils import fov2focal, depth2points, sixD2mtx, mtx2sixD, pts2px
 from scene.keyframe import Keyframe
 from poses.ransac import RANSACEstimator, EstimatorType
+import cv2
 
 class PoseInitializer():
     """Fast pose initializer using MiniBA and the previous frames."""
@@ -26,6 +27,7 @@ class PoseInitializer():
         self.triangulator = triangulator
         self.max_pnp_error = max_pnp_error
         self.matcher = matcher
+        self.alignment_transform = None
 
         self.centre = torch.tensor([(width - 1) / 2, (height - 1) / 2], device='cuda')
         self.num_pts_miniba_bootstrap = args.num_pts_miniba_bootstrap
@@ -133,8 +135,111 @@ class PoseInitializer():
         xyz_indices[mask, :] = -1
         return uvs, xyz_indices
 
+    def triangulate_tracks(self, uvs, infos):
+        num_ba_points = uvs.shape[0]
+        point_cloud_ba = torch.zeros(num_ba_points, 3, device="cuda")
+        point_cloud_validity = torch.zeros(num_ba_points, dtype=torch.bool, device="cuda")
+
+        for i in range(num_ba_points):
+            track = uvs[i]
+            valid_view_indices = torch.where(track[:, 0] != -1)[0]
+
+            if len(valid_view_indices) < 2:
+                continue
+
+            best_point = None
+            max_angle = -1.0
+
+            for j in range(len(valid_view_indices)):
+                for k in range(j + 1, len(valid_view_indices)):
+                    cam_idx1 = valid_view_indices[j]
+                    cam_idx2 = valid_view_indices[k]
+
+                    uv1 = track[cam_idx1]
+                    uv2 = track[cam_idx2]
+                    
+                    Rt1 = infos[cam_idx1]["precomputed_pose"]
+                    Rt2 = infos[cam_idx2]["precomputed_pose"]
+                    
+                    center1 = -Rt1[:3, :3].T @ Rt1[:3, 3]
+                    center2 = -Rt2[:3, :3].T @ Rt2[:3, 3]
+                    
+                    focal = self.f_init
+                    ray1 = torch.nn.functional.normalize(torch.tensor([(uv1[0] - self.width/2)/focal, (uv1[1] - self.height/2)/focal, 1.0], device="cuda"), dim=0)
+                    ray2 = torch.nn.functional.normalize(torch.tensor([(uv2[0] - self.width/2)/focal, (uv2[1] - self.height/2)/focal, 1.0], device="cuda"), dim=0)
+                    
+                    ray1_world = (Rt1[:3, :3].T @ ray1)
+                    ray2_world = (Rt2[:3, :3].T @ ray2)
+                    
+                    angle = torch.acos(torch.dot(ray1_world, ray2_world)) * (180.0 / math.pi)
+
+                    if angle > max_angle:
+                        max_angle = angle
+                        
+                        K = torch.tensor([[focal, 0, self.width/2.0], [0, focal, self.height/2.0], [0, 0, 1]], device="cuda")
+                        proj1 = K @ Rt1[:3, :]
+                        proj2 = K @ Rt2[:3, :]
+                        
+                        points_4d = cv2.triangulatePoints(proj1.cpu().numpy(), proj2.cpu().numpy(), 
+                                                          uv1.cpu().numpy().reshape(2,1), uv2.cpu().numpy().reshape(2,1))
+                        point_3d = torch.from_numpy(points_4d[:3] / points_4d[3]).T.cuda().float()
+                        best_point = point_3d
+
+            if max_angle > math.radians(10.0) and best_point is not None:
+                point_cloud_ba[i] = best_point
+                point_cloud_validity[i] = True
+        
+        print(f"Successfully triangulated {point_cloud_validity.sum()} / {num_ba_points} points.")
+        return point_cloud_ba, point_cloud_validity
+
     @torch.no_grad()
-    def initialize_bootstrap(self, desc_kpts_list: list[DescribedKeypoints], rebooting=False):
+    def initialize_bootstrap_refine(self, desc_kpts_list: list[DescribedKeypoints], bootstrap_infos=None):
+        n_cams = len(desc_kpts_list)
+        npts = self.num_pts_miniba_bootstrap
+
+        for i in range(n_cams):
+            for j in range(i + 1, n_cams):
+                _ = self.matcher(desc_kpts_list[i], desc_kpts_list[j], remove_outliers=True, update_kpts_flag="inliers", kID=i, kID_other=j)        
+
+        uvs, xyz_indices = self.build_problem(desc_kpts_list, self.num_pts_miniba_bootstrap, n_cams, n_cams, 2, list(range(n_cams)))
+
+        point_cloud_ba, valid_mask = self.triangulate_tracks(uvs, bootstrap_infos)
+
+        uvs[~valid_mask, :, :] = -1
+
+        Rs6D_init = torch.stack([mtx2sixD(info["precomputed_pose"][:3, :3]) for info in bootstrap_infos], dim=0).to("cuda")
+        ts_init = torch.stack([info["precomputed_pose"][:3, 3] for info in bootstrap_infos], dim=0).to("cuda")
+        f_init = torch.tensor([self.f_init], device="cuda")
+
+        Rs6D, ts, f, xyz, r, r_init, mask = self.miniba_bootstrap(Rs6D_init, ts_init, f_init, point_cloud_ba, self.centre, uvs.view(-1))
+
+        final_residual = (r * mask).abs().sum()/mask.sum()
+        print(f"Final residual: {final_residual.item()}")
+
+        self.f = f
+
+        Rts_refined = torch.eye(4, device="cuda")[None].repeat(n_cams, 1, 1)
+        Rts_refined[:, :3, :3] = sixD2mtx(Rs6D)
+        Rts_refined[:, :3, 3] = ts
+
+        rel_ts = ts[:-1] - ts[1:]
+        scale = 0.1 / rel_ts.norm(dim=-1).mean()
+
+        inv_first_Rt = torch.linalg.inv(Rts_refined[0])
+
+        self.alignment_transform = {"inv_first_Rt": inv_first_Rt, "scale": scale}
+        
+        final_Rts = torch.eye(4, device="cuda")[None].repeat(n_cams, 1, 1)
+        for i in range(n_cams):
+           aligned_pose = Rts_refined[i] @ inv_first_Rt
+           aligned_pose[:3, 3] *= scale
+           final_Rts[i] = aligned_pose
+
+        return final_Rts, f, final_residual
+
+
+    @torch.no_grad()
+    def initialize_bootstrap(self, desc_kpts_list: list[DescribedKeypoints], bootstrap_infos=None, rebooting=False):
         """
         Estimate focal and initialize the poses of the frames corresponding to desc_kpts_list. 
         """
@@ -184,7 +289,107 @@ class PoseInitializer():
         return Rts, f, final_residual
 
     @torch.no_grad()
-    def initialize_incremental(self, keyframes: list[Keyframe], curr_desc_kpts: DescribedKeypoints, index: int, is_test: bool, curr_img):
+    def initialize_incremental_refine(self, keyframes: list[Keyframe], curr_desc_kpts: DescribedKeypoints, index: int, is_test: bool, image, incr_info=None):
+        Rt = incr_info["precomputed_pose"]
+        aligned_Rt = Rt @ self.alignment_transform["inv_first_Rt"]
+        aligned_Rt[:3, 3] *= self.alignment_transform["scale"] 
+        Rt = aligned_Rt
+        
+        final_xyz_matches = []
+        final_uvs_matches = []
+        
+
+        print(f"Attempting to match against {len(keyframes)} previous keyframes.")
+        for kf in keyframes:
+            matches = self.matcher(curr_desc_kpts, kf.desc_kpts, remove_outliers=True, update_kpts_flag="all", kID=index, kID_other=kf.index)
+            
+            if len(matches.idx) == 0:
+                continue # No visual overlap found with this keyframe
+            
+            old_kf_indices_in_match = matches.idx_other
+            mask_has_3d = kf.desc_kpts.has_pt3d[old_kf_indices_in_match]
+            
+            if mask_has_3d.sum() == 0:
+                continue # Matches were found, but none of them have 3D points
+
+            xyz_world = kf.desc_kpts.pts3d[old_kf_indices_in_match[mask_has_3d]]
+            uvs_new = matches.kpts[mask_has_3d]
+
+            # h, w = image.shape[1], image.shape[2]
+            # image_dims = (w, h)
+            # visualize_3d_reprojection(Rt, kf, xyz_world, uvs_new, self.f, self.centre, image_dims)
+            # print("Exiting after first visualization for debugging.")
+            # exit() # Stop the program here so we can analyze the plot 
+
+            R_w2c, t_w2c = Rt[:3, :3], Rt[:3, 3]
+            xyz_cam = (R_w2c @ xyz_world.T).T + t_w2c
+            
+            # Filter points behind the camera
+            # valid_depth_mask = xyz_cam[:, 2] > 1e-3
+            # if valid_depth_mask.sum() == 0:
+            #     continue
+            valid_depth_mask = torch.ones(xyz_cam.shape[0], device="cuda", dtype=torch.bool)
+
+            uvs_projected = pts2px(xyz_cam[valid_depth_mask], self.f, self.centre)
+            
+            error = torch.linalg.norm(uvs_new[valid_depth_mask] - uvs_projected, dim=-1)
+            
+            inlier_mask = error < (self.max_pnp_error * 5)
+                
+            num_inliers = inlier_mask.sum().item()
+
+            if num_inliers == 0:
+                print(f"  - KF {kf.index}: Found {len(matches.idx)} 2D matches, but all {mask_has_3d.sum()} 3D links failed reprojection check.")
+                continue
+                
+            print(f"  - KF {kf.index}: Found {num_inliers} consistent 2D-3D correspondences.")
+            
+            # 5. Store the successful correspondences
+            final_uvs_matches.append(uvs_new[valid_depth_mask][inlier_mask])
+            final_xyz_matches.append(xyz_world[valid_depth_mask][inlier_mask])
+            
+
+        if not final_xyz_matches:
+            print("Too few inliers for pose initialization after matching.")
+            for keyframe in keyframes:
+                keyframe.desc_kpts.matches.pop(index, None)
+            return None
+            
+        xyz = torch.cat(final_xyz_matches, dim=0)
+        uvs = torch.cat(final_uvs_matches, dim=0)
+
+        print(f"Found a total of {len(xyz)} 2D-3D matches for refinement.")
+        
+        # Subsample points for MiniBA (same logic as before)
+        if len(xyz) >= self.num_pts_miniba_incr:
+            perm = torch.randperm(len(xyz))
+            selected_indices = perm[:self.num_pts_miniba_incr]
+            xyz_ba = xyz[selected_indices]
+            uvs_ba = uvs[selected_indices]
+        else:
+            xyz_ba = torch.cat([xyz, torch.zeros(self.num_pts_miniba_incr - len(xyz), 3, device="cuda")], dim=0)
+            uvs_ba = torch.cat([uvs, -torch.ones(self.num_pts_miniba_incr - len(uvs), 2, device="cuda")], dim=0)
+        
+        # 5. Run MiniBA for refinement (same logic as before)
+        from utils import mtx2sixD
+        Rs6D, ts = mtx2sixD(Rt[:3, :2])[None], Rt[:3, 3][None]
+        Rs6D, ts, _, _, r, r_init, mask = self.miniBA_incr(Rs6D, ts, self.f, xyz_ba, self.centre, uvs_ba.view(-1))
+        
+        final_Rt = torch.eye(4, device="cuda")
+        final_Rt[:3, :3] = sixD2mtx(Rs6D)[0]
+        final_Rt[:3, 3] = ts[0]
+        
+        # A final sanity check on the number of inliers after BA
+        if mask.sum() < self.min_num_inliers:
+            print("Too few inliers after final BA refinement.")
+            for keyframe in keyframes:
+                keyframe.desc_kpts.matches.pop(index, None)
+            return None
+
+        return final_Rt
+
+    @torch.no_grad()
+    def initialize_incremental(self, keyframes: list[Keyframe], curr_desc_kpts: DescribedKeypoints, index: int, is_test: bool, curr_img, incr_info=None):
         """
         Initialize the pose of the frame given by curr_desc_kpts and index using the previously registered keyframes.
         """
