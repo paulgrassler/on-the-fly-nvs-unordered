@@ -175,7 +175,7 @@ class ImageDataset:
             focal_x = camera.params[0]
             focal_y = camera.params[1] if camera.model == "PINHOLE" else focal_x
             focal = (focal_x + focal_y) / 2
-            focal = focal_x * self.width / camera.width
+            focal = focal * self.width / camera.width
 
             # Pose
             Rt = np.eye(4, dtype=np.float32)
